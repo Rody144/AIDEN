@@ -1,0 +1,12 @@
+﻿# secrets
+.env
+.env.local
+app/.env
+app/.env.local
+
+# venv & cache & build
+.venv/
+_pycache_/
+*.pyc
+logs/
+data/index/
