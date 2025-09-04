@@ -1,76 +1,128 @@
-from typing import List, Dict, Tuple
-import numpy as np
+# app/cli.py
+# CLI بسيط يعمل مع HuggingFaceProvider فقط
 
-# موجودين عندك بالفعل:
-# from openai import OpenAI
-# import anthropic
+import argparse
+import json
+from typing import List, Dict
 
-from huggingface_hub import InferenceClient
-from .config import (
-    # … مفاتيح OpenAI/Anthropic لو بتستخدميهم …
-    HUGGINGFACE_TOKEN, HF_CHAT_MODEL, HF_EMBED_MODEL
-)
+# مزوّد هاجينج فيس
+from .providers import HuggingFaceProvider
 
-class HuggingFaceProvider:
-    """
-    شات + Embeddings باستخدام Inference API.
-    - الشات: بننسّق رسائل chat إلى prompt واحد لـ instruct models.
-    - embeddings: باستخدام task=feature-extraction (جملة لكل سطر).
-    """
-    def _init_(self, token: str = None, chat_model: str = None, embed_model: str = None):
-        self.token = token or HUGGINGFACE_TOKEN
-        if not self.token:
-            raise RuntimeError("HUGGINGFACE_TOKEN غير موجود في البيئة (.env)")
-        self.chat_model = chat_model or HF_CHAT_MODEL
-        self.embed_model = embed_model or HF_EMBED_MODEL
-        self.chat_client = InferenceClient(model=self.chat_model, token=self.token)
-        self.embed_client = InferenceClient(model=self.embed_model, token=self.token)
+# مخزن الـ RAG
+from .simple_doc_store import SimpleDocStore
 
-    def _format_chat(self, messages: List[Dict[str, str]]) -> str:
-        """حوّل رسائل OpenAI-style إلى نص واحد لنموذج instruct."""
-        system = ""
-        user_blocks = []
-        for m in messages:
-            role, content = m.get("role"), m.get("content", "")
-            if role == "system":
-                system += content + "\n"
-            elif role == "user":
-                user_blocks.append(f"User: {content}")
-            elif role == "assistant":
-                user_blocks.append(f"Assistant: {content}")
-        prompt = ""
-        if system.strip():
-            prompt += f"[System]\n{system.strip()}\n\n"
-        prompt += "\n".join(user_blocks) + "\nAssistant:"
-        return prompt
+# ============== مساعدات ==============
 
-    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.2, max_new_tokens: int = 512):
-        prompt = self._format_chat(messages)
-        # text-generation (stream=False)
-        text = self.chat_client.text_generation(
-            prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=temperature > 0,
-            # stop sequences اختيارية حسب النموذج
-        )
-        # Inference API ما بيرجعش usage tokens بدقة؛ هنرجع 0
-        usage = {"input_tokens": 0, "output_tokens": 0}
-        return text.strip(), usage, self.chat_model
+def _build_messages(system: str, user: str, history: List[Dict] = None):
+    msgs = []
+    if system:
+        msgs.append({"role": "system", "content": system})
+    if history:
+        msgs.extend(history)
+    msgs.append({"role": "user", "content": user})
+    return msgs
 
-    def embed(self, texts: List[str]) -> np.ndarray:
-        # feature-extraction بيرجع قائمة أبعاد لكل نص
-        # هنضمن إن الناتج np.array [N, D]
-        vecs = []
-        for t in texts:
-            feat = self.embed_client.feature_extraction(t)
-            # بعض النماذج ترجع [seq_len, D]؛ ناخد متوسط المحاور
-            arr = np.array(feat, dtype="float32")
-            if arr.ndim == 2:
-                arr = arr.mean(axis=0)
-            vecs.append(arr)
-        # محاذاة الأبعاد: (لو اختلفت الأبعاد — غير متوقع — هنرمي خطأ واضح)
-        dims = {v.shape for v in vecs}
-        if len(dims) != 1:
-            raise RuntimeError(f"عدم تطابق أبعاد embeddings: {dims}")
-        return np.vstack(vecs)
+# ============== أوامر CLI ==============
+
+def chat_cmd(args):
+    """محادثة برسالة واحدة مع مزوّد HF"""
+    system = "أنت مساعد أعمال مهذب ودقيق."
+    user_msg = args.message
+
+    p = HuggingFaceProvider()
+    messages = _build_messages(system, user_msg)
+    text, usage, used_model = p.chat(messages, temperature=args.temperature)
+
+    print("\n=== Reply ===\n")
+    print(text)
+    meta = {"provider": "hf", "model": used_model, "usage": usage}
+    print("\n--- meta ---")
+    print(json.dumps(meta, ensure_ascii=False, indent=2))
+
+
+def ingest_cmd(args):
+    """بناء الفهرس للـ RAG"""
+    store = SimpleDocStore()
+    # جرّب الاسمَين لضمان التوافق
+    if hasattr(store, "ingest_folder"):
+        n = store.ingest_folder(args.path)
+    else:
+        n = store.ingest(args.path)  # type: ignore
+    print(f"✅ Ingest done for path: {args.path} (chunks={n})")
+
+
+def ask_cmd(args):
+    """سؤال باستخدام RAG + توليد إجابة بالمزوّد HF"""
+    store = SimpleDocStore()
+
+    # جلب السياق من الفهرس
+    k = getattr(args, "k", 5)
+    if hasattr(store, "search"):
+        results = store.search(args.question, k=k)
+        context = "\n\n".join([f"[{i+1}] {r['text']}" for i, r in enumerate(results)])
+        sources = [f"{r['meta'].get('source','?')}#chunk{r['meta'].get('chunk','?')} (score={r.get('score',0):.3f})"
+                   for r in results]
+    else:
+        # لو فيه method ask داخلي بيرجع نص جاهز
+        answer = store.ask(args.question)  # type: ignore
+        print("\n=== Answer ===\n")
+        print(answer)
+        return
+
+    # توليد الإجابة باستخدام القالب العام
+    system = "أنت مساعد يستخدم سياق الشركة للإجابة بدقة."
+    prompt = (
+        "السياق من مستندات الشركة:\n"
+        f"{context}\n\n"
+        f"السؤال:\n{args.question}\n\n"
+        "استخدم السياق بالأعلى. إن لم تجد الإجابة، قل أنك لا تملك معلومات كافية."
+    )
+
+    p = HuggingFaceProvider()
+    messages = _build_messages(system, prompt)
+    text, usage, used_model = p.chat(messages, temperature=args.temperature)
+
+    # طباعة النتيجة + المصادر المستخدمة
+    print("\n=== Context used ===")
+    for s in sources:
+        print(s)
+    print("\n=== Answer ===\n")
+    print(text)
+    meta = {"provider": "hf", "model": used_model, "usage": usage}
+    print("\n--- meta ---")
+    print(json.dumps(meta, ensure_ascii=False, indent=2))
+
+
+# ============== نقطة الدخول ==============
+
+def main():
+    ap = argparse.ArgumentParser(prog="aiden", description="AIDEN CLI (Hugging Face only)")
+    sub = ap.add_subparsers()
+
+    # chat
+    p = sub.add_parser("chat", help="Basic one-shot chat")
+    p.add_argument("--message", required=True)
+    p.add_argument("--temperature", type=float, default=0.2)
+    p.set_defaults(func=chat_cmd)
+
+    # ingest
+    pi = sub.add_parser("ingest", help="Ingest txt/md files into the local RAG index")
+    pi.add_argument("--path", required=True, help="Folder path containing .txt/.md documents")
+    pi.set_defaults(func=ingest_cmd)
+
+    # ask
+    pa = sub.add_parser("ask", help="Ask a question using RAG over ingested docs")
+    pa.add_argument("--question", required=True)
+    pa.add_argument("--k", type=int, default=5)
+    pa.add_argument("--temperature", type=float, default=0.2)
+    pa.set_defaults(func=ask_cmd)
+
+    args = ap.parse_args()
+    if hasattr(args, "func"):
+        args.func(args)
+    else:
+        ap.print_help()
+
+
+if __name__ == "__main__":
+    main()
